@@ -1,10 +1,19 @@
 import json
 import os
+import time
 
+import psycopg
 from bottle import Bottle, request, response, run
 
 from auth import authenticate, issue_token, read_user
-from db import connect, init_db, publish
+from db import (
+    RETRY_DELAY_SECONDS,
+    RETRY_LIMIT,
+    connect,
+    init_db,
+    publish,
+    rollback_publication,
+)
 from metric import CURRENT, rate_label
 
 app = Bottle()
@@ -104,16 +113,71 @@ def publish_current(trial_id):
         return _json({"detail": "未登录"}, 401)
     if user["role"] != "writer":
         return _json({"detail": "见证员不能出数"}, 403)
+    # 早班、晚班司磅同时归档同一批次时排队写入：行锁串行化，后手重试有限次；
+    # 仍抢不到就显式报争用，绝不静默覆盖，也不留半截台账。
+    for attempt in range(RETRY_LIMIT):
+        try:
+            with connect() as conn:
+                exists = conn.execute(
+                    "SELECT id FROM trials WHERE id = %s", (trial_id,)
+                ).fetchone()
+                if not exists:
+                    return _json({"detail": "没有这个批次"}, 404)
+                publication_id, skipped = publish(
+                    conn, trial_id, user["username"], CURRENT
+                )
+                payload = _trial_payload(conn, trial_id)
+                payload["skipped"] = skipped
+                payload["publication_id"] = publication_id
+                payload["detail"] = (
+                    "该批次已按现行口径归档，本次重复归档已跳过"
+                    if skipped
+                    else "已按现行口径整批归档"
+                )
+                conn.commit()
+            return _json(payload)
+        except ValueError as exc:
+            # 口径验收失败：with 退出时事务整体回滚，没有任何半条写入。
+            return _json({"detail": str(exc)}, 400)
+        except (psycopg.errors.DeadlockDetected, psycopg.errors.SerializationFailure):
+            # 行锁争用触发死锁/序列化失败：后手等待后排队重试，不静默吞掉。
+            if attempt == RETRY_LIMIT - 1:
+                return _json(
+                    {"detail": "该批次正由另一位司磅归档，争用未抢到，请稍后再试"},
+                    409,
+                )
+            time.sleep(RETRY_DELAY_SECONDS * (attempt + 1))
+
+
+@app.post("/api/trials/<trial_id:int>/rollback")
+def rollback_trial(trial_id):
+    user = _user()
+    if not user:
+        return _json({"detail": "未登录"}, 401)
+    if user["role"] != "writer":
+        return _json({"detail": "见证员不能撤回归档"}, 403)
+    try:
+        body = json.loads(request.body.read() or b"{}")
+    except json.JSONDecodeError:
+        return _json({"detail": "请求不是合法的 JSON"}, 400)
+    keep_valid = bool(body.get("keep_valid", False))
     try:
         with connect() as conn:
-            exists = conn.execute("SELECT id FROM trials WHERE id = %s", (trial_id,)).fetchone()
-            if not exists:
-                return _json({"detail": "没有这个批次"}, 404)
-            publish(conn, trial_id, user["username"], CURRENT)
+            result = rollback_publication(conn, trial_id, keep_valid)
             payload = _trial_payload(conn, trial_id)
+            payload["rollback"] = result
+            payload["detail"] = (
+                f"已撤回 {result['removed']} 条不合格归档，保留 {result['remaining']} 条合格记录"
+                if keep_valid
+                else f"已整笔撤回 {result['removed']} 条归档，批次回到待重算"
+            )
             conn.commit()
+    except LookupError:
+        return _json({"detail": "没有这个批次"}, 404)
     except ValueError as exc:
         return _json({"detail": str(exc)}, 400)
+    except (psycopg.errors.DeadlockDetected, psycopg.errors.SerializationFailure):
+        return _json({"detail": "该批次正由另一位司磅处理，争用未抢到，请稍后再试"}, 409)
     return _json(payload)
 
 
